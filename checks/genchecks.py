@@ -20,6 +20,7 @@ nret = 1
 isa = "rv32i"
 ilen = 32
 xlen = 32
+csrs = set()
 compr = False
 
 depths = list()
@@ -32,6 +33,7 @@ solver = "boolector"
 dumpsmt2 = False
 sbycmd = "sby"
 config = dict()
+mode = "bmc"
 
 if len(sys.argv) > 1:
     assert len(sys.argv) == 2
@@ -82,9 +84,19 @@ if "options" in config:
             assert len(line) == 1
             dumpsmt2 = True
 
+        elif line[0] == "mode":
+            assert len(line) == 2
+            if line[1] == "prove":
+                mode = line[1]
+
         else:
             print(line)
             assert 0
+
+if "csrs" in config:
+    for line in config["csrs"].split("\n"):
+        for item in line.split():
+            csrs.add(item)
 
 if "64" in isa:
     xlen = 64
@@ -108,12 +120,12 @@ def print_hfmt(f, text, **kwargs):
 
 hargs = dict()
 hargs["basedir"] = basedir
-hargs["cfgname"] = cfgname
 hargs["core"] = corename
 hargs["nret"] = nret
 hargs["xlen"] = xlen
 hargs["ilen"] = ilen
 hargs["append"] = 0
+hargs["mode"] = mode
 
 instruction_checks = set()
 consistency_checks = set()
@@ -173,7 +185,7 @@ def check_insn(insn, chanidx, csr_mode=False):
     with open("%s/%s.sby" % (cfgname, check), "w") as sby_file:
         print_hfmt(sby_file, """
                 : [options]
-                : mode bmc
+                : mode @mode@
                 : expect pass,fail
                 : append @append@
                 : tbtop wrapper.uut
@@ -196,20 +208,21 @@ def check_insn(insn, chanidx, csr_mode=False):
 
         print_hfmt(sby_file, """
                 : prep -flatten -nordff -top rvfi_testbench
+                : chformal -early
                 :
                 : [files]
-                : @basedir@/@cfgname@/rvfi_macros.vh
-                : @basedir@/@cfgname@/rvfi_channel.sv
-                : @basedir@/@cfgname@/rvfi_testbench.sv
+                : @basedir@/checks/rvfi_macros.vh
+                : @basedir@/checks/rvfi_channel.sv
+                : @basedir@/checks/rvfi_testbench.sv
         """, **hargs)
 
         if csr_mode:
             print_hfmt(sby_file, """
-                    : @basedir@/@cfgname@/rvfi_csrw_check.sv
+                    : @basedir@/checks/rvfi_csrw_check.sv
             """, **hargs)
         else:
             print_hfmt(sby_file, """
-                    : @basedir@/@cfgname@/rvfi_insn_check.sv
+                    : @basedir@/checks/rvfi_insn_check.sv
                     : @basedir@/insns/insn_@insn@.v
             """, **hargs)
 
@@ -225,10 +238,19 @@ def check_insn(insn, chanidx, csr_mode=False):
                 : `define RISCV_FORMAL_CHANNEL_IDX @channel@
         """, **hargs)
 
+        if mode == "prove":
+            print("`define RISCV_FORMAL_UNBOUNDED", file=sby_file)
+
+        for csr in sorted(csrs):
+            print("`define RISCV_FORMAL_CSR_%s" % csr.upper(), file=sby_file)
+
+        if csr_mode and insn in ("mcycle", "minstret"):
+            print("`define RISCV_FORMAL_CSRWH", file=sby_file)
+
         if csr_mode:
             print_hfmt(sby_file, """
                     : `define RISCV_FORMAL_CHECKER rvfi_csrw_check
-                    : `define RISCV_FORMAL_CSR_NAME @insn@
+                    : `define RISCV_FORMAL_CSRW_NAME @insn@
             """, **hargs)
         else:
             print_hfmt(sby_file, """
@@ -269,22 +291,35 @@ with open("../../insns/isa_%s.txt" % isa) as isa_file:
         for chanidx in range(nret):
             check_insn(insn.strip(), chanidx)
 
-for csr in ["misa", "mcycle", "minstret"]:
+for csr in sorted(csrs):
     for chanidx in range(nret):
         check_insn(csr, chanidx, csr_mode=True)
 
 # ------------------------------ Consistency Checkers ------------------------------
 
-def check_cons(check, chanidx=None, start=None, trig=None, depth=None):
-    hargs["check"] = check
+def check_cons(check, chanidx=None, start=None, trig=None, depth=None, csr_mode=False):
+    if csr_mode:
+        csr_name = check
+        check = "csrc_" + csr_name
+        hargs["check"] = "csrc"
 
-    if chanidx is not None:
-        depth_cfg = get_depth_cfg([check, "%s_ch%d" % (check, chanidx)])
-        hargs["channel"] = "%d" % chanidx
-        check += "_ch%d" % chanidx
+        if chanidx is not None:
+            depth_cfg = get_depth_cfg(["csrc", check, "csrc_ch%d" % chanidx, "%s_ch%d" % (check, chanidx)])
+            hargs["channel"] = "%d" % chanidx
+            check += "_ch%d" % chanidx
 
+        else:
+            depth_cfg = get_depth_cfg(["csrc", check])
     else:
-        depth_cfg = get_depth_cfg([check])
+        hargs["check"] = check
+
+        if chanidx is not None:
+            depth_cfg = get_depth_cfg([check, "%s_ch%d" % (check, chanidx)])
+            hargs["channel"] = "%d" % chanidx
+            check += "_ch%d" % chanidx
+
+        else:
+            depth_cfg = get_depth_cfg([check])
 
     if depth_cfg is None: return
 
@@ -312,7 +347,7 @@ def check_cons(check, chanidx=None, start=None, trig=None, depth=None):
     with open("%s/%s.sby" % (cfgname, check), "w") as sby_file:
         print_hfmt(sby_file, """
                 : [options]
-                : mode bmc
+                : mode @mode@
                 : expect pass,fail
                 : append @append@
                 : tbtop wrapper.uut
@@ -340,12 +375,13 @@ def check_cons(check, chanidx=None, start=None, trig=None, depth=None):
 
         print_hfmt(sby_file, """
                 : prep -flatten -nordff -top rvfi_testbench
+                : chformal -early
                 :
                 : [files]
-                : @basedir@/@cfgname@/rvfi_macros.vh
-                : @basedir@/@cfgname@/rvfi_channel.sv
-                : @basedir@/@cfgname@/rvfi_testbench.sv
-                : @basedir@/@cfgname@/rvfi_@check@_check.sv
+                : @basedir@/checks/rvfi_macros.vh
+                : @basedir@/checks/rvfi_channel.sv
+                : @basedir@/checks/rvfi_testbench.sv
+                : @basedir@/checks/rvfi_@check@_check.sv
                 :
                 : [file defines.sv]
         """, **hargs)
@@ -359,6 +395,17 @@ def check_cons(check, chanidx=None, start=None, trig=None, depth=None):
                 : `define RISCV_FORMAL_RESET_CYCLES @start@
                 : `define RISCV_FORMAL_CHECK_CYCLE @depth@
         """, **hargs)
+
+        if mode == "prove":
+            print("`define RISCV_FORMAL_UNBOUNDED", file=sby_file)
+
+        for csr in sorted(csrs):
+            print("`define RISCV_FORMAL_CSR_%s" % csr.upper(), file=sby_file)
+
+        if csr_mode:
+            if csr_name in ("mcycle", "minstret"):
+                print("`define RISCV_FORMAL_CSRC_UPCNT", file=sby_file)
+            print("`define RISCV_FORMAL_CSRC_NAME " + csr_name, file=sby_file)
 
         if blackbox and hargs["check"] != "liveness":
             print("`define RISCV_FORMAL_BLACKBOX_ALU", file=sby_file)
@@ -399,8 +446,13 @@ for i in range(nret):
     check_cons("unique", chanidx=i, start=0, trig=1, depth=2)
     check_cons("causal", chanidx=i, start=0, depth=1)
     check_cons("ill", chanidx=i, depth=0)
+    check_cons("const_2_time", chanidx=i, start=0, trig=1, depth=2)
 
 check_cons("hang", start=0, depth=1)
+
+for csr in sorted(csrs):
+    for chanidx in range(nret):
+        check_cons(csr, chanidx, start=0, depth=1, csr_mode=True)
 
 # ------------------------------ Makefile ------------------------------
 
@@ -429,4 +481,3 @@ with open("%s/makefile" % cfgname, "w") as mkfile:
         print(".PHONY: %s" % check, file=mkfile)
 
 print("Generated %d checks." % (len(consistency_checks) + len(instruction_checks)))
-
